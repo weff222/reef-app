@@ -3830,7 +3830,7 @@ function downloadBlob(blob,name){ const url=URL.createObjectURL(blob),a=document
       case 'channel':{
         const s=serverFor(d.sid),c=d.channel?s?.channels.find(x=>x.id===d.channel):null;if(!s)break;
         modal.innerHTML=formDialog(c?'Edytuj kanał':'Dodaj kanał','channel-form',inputHTML('name','Nazwa kanału','Np. projekty',`value="${esc(c?.name||'')}" maxlength="36" required`)+inputHTML('description','Temat (opcjonalnie)','',`value="${esc(c?.description||'')}" maxlength="140"`)+`<label class="label-input">Kategoria${customPicker('category',c?.category||s.categories[0]?.id,s.categories.map(x=>[x.id,x.name]))}</label>
-          ${c?'':`<label class="label-input">Typ${customPicker('type','text',[['text','Tekstowy'],['voice','Głosowy']])}</label>`}<label class="label-input" id="channel-limit" ${c?.type==='voice'?'':'hidden'}>Limit uczestników<input class="field" type="number" name="limit" min="0" max="12" value="${c?.limit||0}"><small class="form-note">0 = domyślny limit 8 osób.</small></label>`,c?'Zapisz kanał':'Utwórz kanał');break;}
+          ${c?'':`<label class="label-input">Typ${customPicker('type','text',[['text','Tekstowy'],['voice','Głosowy']])}</label>`}<label class="label-input" id="channel-limit" ${c?.type==='voice'?'':'hidden'}>Limit uczestników<input class="field" type="number" name="limit" min="0" max="5" value="${c?.limit||0}"><small class="form-note">0 = domyślny limit 5 osób.</small></label>`,c?'Zapisz kanał':'Utwórz kanał');break;}
       case 'server-invite':{
         const s=serverFor(d.sid),c=d.code;
         modal.innerHTML=`${modalHead('Zaproś na '+(s?.name||'serwer'))}<div class="modal-body scroll"><p class="small">Wyślij zaproszenie znajomemu albo udostępnij kod.</p>${searchField('server-invite-query',d.query,'Szukaj znajomych')}<div id="server-invite-people" class="list-frame">${serverInvitePeople(d)}</div><div class="invite-code"><p class="settings-cap">Kod zaproszenia</p>${d.codeError?`<p class="form-error">${esc(d.codeError)}</p>`:c?`<div class="invite-code-row"><input class="field" id="share-code" value="${esc(c.code)}" aria-label="Kod zaproszenia" readonly>${button('copy-invite','Kopiuj',{icon:'copy'})}</div><p class="form-note">Ważny do ${esc(fullDate.format(c.expiresAt))} · ${c.maxUses-c.uses} użyć pozostało</p>`:'<p class="form-note" role="status">Pobieranie kodu…</p>'}${button('regen-invite','Wygeneruj nowy kod',{icon:'clock',css:'ghost'})}</div></div>${modalFoot(button('close-dialog','Gotowe',{css:'primary'}))}`;break;}
@@ -4381,8 +4381,18 @@ async function getFreshIceConfig(force=false){
   })();
   try{return await icePending;}finally{icePending=null;}
 }
+function reefApplyDtx(desc){
+  if(!desc?.sdp)return desc;
+  const m=desc.sdp.match(/a=rtpmap:(\d+)\s+opus\/48000/i);
+  if(!m)return desc;
+  const pt=m[1],re=new RegExp(`a=fmtp:${pt} ([^\r\n]*)`),cur=desc.sdp.match(re);
+  if(cur){if(!/usedtx=1\b/i.test(cur[1]))desc.sdp=desc.sdp.replace(re,`a=fmtp:${pt} ${cur[1]};usedtx=1`);}
+  else desc.sdp=desc.sdp.replace(m[0],`${m[0]}\r\na=fmtp:${pt} usedtx=1`);
+  return desc;
+}
+async function reefLocal(pc,desc){await pc.setLocalDescription(reefApplyDtx(desc));return pc.localDescription;}
 const RTC={
-  stream:null,callId:null,voicePath:null,muted:false,peers:new Map(),hold:new Map(),timer:0,working:false,failTimer:0,statsTimer:0,busyMessage:'',ice:null,failedPeers:new Set(),pendingVoice:null,pendingSignals:[],
+  stream:null,callId:null,voicePath:null,muted:false,autoMuted:false,lastVoice:0,speakTicks:0,monitor:null,peers:new Map(),hold:new Map(),timer:0,working:false,failTimer:0,statsTimer:0,busyMessage:'',ice:null,failedPeers:new Set(),pendingVoice:null,pendingSignals:[],
   async mic(){
     if(!isSecureContext||!navigator.mediaDevices?.getUserMedia)throw Error('Ta przeglądarka nie udostępnia mikrofonu dla pliku lokalnego. Otwórz pobrany TYPHON w aktualnej przeglądarce i zezwól na mikrofon.');
     const id=readDevice('xxxchat_audio_input');
@@ -4398,7 +4408,8 @@ const RTC={
     try{
       const stream=await this.mic();
       if(g!==generation){stream.getTracks().forEach(t=>t.stop());return;}
-      this.stream=stream;this.muted=false;this.ice=await getFreshIceConfig();if(g!==generation||this.stream!==stream)return;
+      this.stream=stream;this.muted=false;this.autoMuted=false;this.lastVoice=Date.now();this.speakTicks=0;this.ice=await getFreshIceConfig();if(g!==generation||this.stream!==stream)return;
+      this.startVoiceMonitor();
       await join(g);if(g!==generation)return;
       this.startHeartbeat();await refresh();
       if(g!==generation)return;
@@ -4425,11 +4436,72 @@ const RTC={
     if(path)await change('rtc.voice.leave',{path});
     if(selectedChannel()?.type==='voice')renderMain();this.paint();
   },
-  toggleMute(){
+  async toggleMute(){
     if(!this.stream)return;
-    this.muted=!this.muted;this.stream.getAudioTracks().forEach(t=>t.enabled=!this.muted);
+    this.muted=!this.muted;this.autoMuted=false;
+    this.stream.getAudioTracks().forEach(t=>t.enabled=!this.muted);
+    const track=this.stream.getAudioTracks()[0];
+    for(const slot of this.peers.values()){
+      for(const sender of (slot.senders||[])){
+        try{await sender.replaceTrack(this.muted?null:track);}
+        catch{try{const p=sender.getParameters();if(p.encodings)p.encodings.forEach(e=>e.active=!this.muted);await sender.setParameters(p);}catch{}}
+      }
+    }
     const cmd=this.callId?'rtc.call.mute':'rtc.voice.mute';
     change(cmd,this.callId?{id:this.callId,muted:this.muted}:{path:this.voicePath,muted:this.muted});this.paint();
+  },
+  applySenders(){
+    const track=this.stream?.getAudioTracks()[0];
+    const send=!(this.muted||this.autoMuted);
+    for(const slot of this.peers.values()){
+      for(const sender of (slot.senders||[])){
+        (async()=>{try{await sender.replaceTrack(send?track:null);}catch{try{const p=sender.getParameters();if(p.encodings)p.encodings.forEach(e=>e.active=send);await sender.setParameters(p);}catch{}}})();
+      }
+    }
+  },
+  setAutoMuted(v){
+    this.autoMuted=!!v;
+    if(v)toast('Mikrofon został wyciszony z powodu braku aktywności. Zacznij mówić, aby wrócić do rozmowy.');
+    this.applySenders();
+  },
+  playUnmuteTone(){
+    try{
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();
+      const now=ctx.currentTime;
+      [[660,0],[880,0.12]].forEach(([freq,off])=>{
+        const osc=ctx.createOscillator(),gain=ctx.createGain();
+        osc.type='sine';osc.frequency.value=freq;
+        gain.gain.setValueAtTime(0.04,now+off);
+        gain.gain.exponentialRampToValueAtTime(0.0001,now+off+0.1);
+        osc.connect(gain);gain.connect(ctx.destination);
+        osc.start(now+off);osc.stop(now+off+0.1);
+      });
+      setTimeout(()=>ctx.close().catch(()=>{}),300);
+    }catch{}
+  },
+  startVoiceMonitor(){
+    if(this.monitor||!this.stream)return;
+    try{
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();
+      const src=ctx.createMediaStreamSource(new MediaStream(this.stream.getAudioTracks()));
+      const analyser=ctx.createAnalyser();analyser.fftSize=1024;src.connect(analyser);
+      const data=new Float32Array(analyser.fftSize);
+      this.monitor={ctx,src,analyser,data,interval:0};
+      this.monitor.interval=setInterval(()=>{
+        if(!this.stream||!this.monitor)return;
+        analyser.getFloatTimeDomainData(data);
+        let sum=0;for(let i=0;i<data.length;i++)sum+=data[i]*data[i];
+        const rms=Math.sqrt(sum/data.length);
+        if(rms>0.015){this.lastVoice=Date.now();this.speakTicks++;}
+        else this.speakTicks=0;
+        if(!this.muted&&!this.autoMuted&&Date.now()-this.lastVoice>60000)this.setAutoMuted(true);
+        if(this.autoMuted&&!this.muted&&this.speakTicks>=3){
+          this.playUnmuteTone();
+          setTimeout(()=>{if(this.autoMuted&&!this.muted){this.setAutoMuted(false);this.applySenders();}},120);
+          this.speakTicks=0;
+        }
+      },100);
+    }catch(e){console.warn(e);}
   },
   startHeartbeat(){
     clearInterval(this.timer);
@@ -4443,7 +4515,8 @@ const RTC={
   teardown(){
     clearInterval(this.timer);clearInterval(this.statsTimer);clearTimeout(this.failTimer);this.failTimer=0;
     for(const id of this.peers.keys())this.closePeer(id);
-    this.hold.clear();this.failedPeers.clear();this.ice=null;this.pendingSignals=[];this.pendingVoice=null;this.stream?.getTracks().forEach(t=>t.stop());this.stream=null;this.voicePath=null;this.callId=null;this.muted=false;this.busyMessage='';this.working=false;stopOutgoingRing();stopIncomingRing();
+    clearInterval(this.monitor?.interval);if(this.monitor?.ctx)this.monitor.ctx.close().catch(()=>{});this.monitor=null;
+    this.hold.clear();this.failedPeers.clear();this.ice=null;this.pendingSignals=[];this.pendingVoice=null;this.stream?.getTracks().forEach(t=>t.stop());this.stream=null;this.voicePath=null;this.callId=null;this.muted=false;this.autoMuted=false;this.speakTicks=0;this.busyMessage='';this.working=false;stopOutgoingRing();stopIncomingRing();
     if($('#call-dock'))$('#call-dock').hidden=true;
   },
   send(peer,kind,payload){
@@ -4453,9 +4526,9 @@ const RTC={
   },
   ensure(id){
     if(this.peers.has(id))return this.peers.get(id);
-    const pc=new RTCPeerConnection({iceServers:this.ice?.iceServers||reefStun,iceCandidatePoolSize:2}),slot={pc,offered:false,player:null,quality:null,restarts:0,retryTimer:0,restarting:false};
+    const pc=new RTCPeerConnection({iceServers:this.ice?.iceServers||reefStun,iceCandidatePoolSize:2}),slot={pc,offered:false,player:null,quality:null,restarts:0,retryTimer:0,restarting:false,senders:[]};
     this.peers.set(id,slot);
-    this.stream.getAudioTracks().forEach(t=>pc.addTrack(t,this.stream));
+    const track=this.stream.getAudioTracks()[0];if(track){const sender=pc.addTrack(track,this.stream);slot.senders.push(sender);if(this.muted||this.autoMuted)sender.replaceTrack(null).catch(()=>{});}
     pc.onicecandidate=e=>{if(e.candidate)this.send(id,'candidate',e.candidate.toJSON()).catch(()=>{});};
     pc.ontrack=e=>{
       if(!slot.player){const player=new Audio();player.autoplay=true;player.dataset.remotePeer=id;player.hidden=true;document.body.append(player);slot.player=player;}
@@ -4487,7 +4560,7 @@ const RTC={
         const ice=await getFreshIceConfig(true);if(this.peers.get(id)!==slot||!this.stream||slot.pc.connectionState==='connected')return;
         this.ice=ice;slot.pc.setConfiguration({...slot.pc.getConfiguration(),iceServers:ice.iceServers});
         if(slot.pc.signalingState==='have-local-offer')await slot.pc.setLocalDescription({type:'rollback'});
-        await slot.pc.setLocalDescription(await slot.pc.createOffer({iceRestart:true}));await this.send(id,'offer',slot.pc.localDescription.toJSON());
+        await reefLocal(slot.pc, await slot.pc.createOffer({iceRestart:true}));await this.send(id,'offer',slot.pc.localDescription.toJSON());
       }catch{ /* One more scheduled attempt, at most two per peer. */ }
       finally{slot.restarting=false;if(this.peers.get(id)===slot&&slot.pc.connectionState!=='connected')this.queueRestart(id,slot,9000);this.paint();}
     },controller?delay:23500);
@@ -4514,7 +4587,7 @@ const RTC={
   async offer(id){
     if(!this.stream||this.failedPeers.has(id))return;
     try {const x=this.ensure(id);if(x.offered)return;x.offered=true;
-      await x.pc.setLocalDescription(await x.pc.createOffer());await this.send(id,'offer',x.pc.localDescription.toJSON());
+      await reefLocal(x.pc, await x.pc.createOffer());await this.send(id,'offer',x.pc.localDescription.toJSON());
       if(this.peers.get(id)===x&&x.pc.connectionState!=='connected')x.setupTimer=setTimeout(()=>this.queueRestart(id,x,100),23000);
     }catch(e){if(this.stream){const slot=this.peers.get(id);if(slot)this.queueRestart(id,slot,1300);else this.failedPeers.add(id);}}
   },
@@ -4532,7 +4605,7 @@ const RTC={
       const x=this.ensure(m.from);await x.pc.setRemoteDescription(m.payload);
       for(const c of this.hold.get(m.from)||[])await x.pc.addIceCandidate(c).catch(()=>{});
       this.hold.delete(m.from);
-      if(m.kind==='offer'){await x.pc.setLocalDescription(await x.pc.createAnswer());await this.send(m.from,'answer',x.pc.localDescription.toJSON());}
+      if(m.kind==='offer'){await reefLocal(x.pc, await x.pc.createAnswer());await this.send(m.from,'answer',x.pc.localDescription.toJSON());}
     }catch(e){if(this.stream)console.warn('[TYPHON] Nie udało się obsłużyć sygnału WebRTC.',e.name);}
   },
   update(state){
