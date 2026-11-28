@@ -1,0 +1,71 @@
+name: Release TYPHON
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+          - platform: ubuntu-22.04
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install linux deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf zip
+
+      - name: install tauri cli
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: build & publish to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: cargo tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: 'TYPHON ${{ github.ref_name }}'
+          releaseBody: 'TYPHON Desktop (${{ github.ref_name }}). Pobierz Windows.zip (setup.exe + README) lub Linux.zip (AppImage/deb + README).'
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+
+      - name: package & upload Windows.zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-pkg | Out-Null
+          Copy-Item README.md dist-pkg/
+          Get-ChildItem -Path src-tauri/target/release/bundle/nsis -Filter "*-setup.exe" -ErrorAction SilentlyContinue | Copy-Item -Destination dist-pkg/
+          Get-ChildItem -Path src-tauri/target/release/bundle/msi -Filter "*.msi" -ErrorAction SilentlyContinue | Copy-Item -Destination dist-pkg/
+          Compress-Archive -Path dist-pkg/* -DestinationPath Windows.zip -Force
+          gh release upload "${{ github.ref_name }}" Windows.zip --clobber
+
+      - name: package & upload Linux.zip
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist-pkg
+          cp README.md dist-pkg/
+          find src-tauri/target/release/bundle -type f \( -name "*.AppImage" -o -name "*.deb" \) -exec cp {} dist-pkg/ \;
+          (cd dist-pkg && zip -r ../Linux.zip .)
+          gh release upload "${{ github.ref_name }}" Linux.zip --clobber
